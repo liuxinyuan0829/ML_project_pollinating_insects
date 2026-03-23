@@ -1,25 +1,3 @@
-"""
-Preprocessing Pipeline for Pollinating Insects (Butterfly) Decline Analysis
-============================================================================
-Research Question: What caused the decrease in pollinating insects (butterfly)?
-
-This script:
-1. Loads all CSV data sources (agri-environment schemes, habitat connectivity,
-   butterfly abundance, plant abundance)
-2. Cleans and aligns datasets to a common year-based index
-3. Imputes missing values via linear interpolation
-4. Applies Simulated Annealing to refine imputed values for maximum data quality
-5. Engineers features relevant to explaining butterfly decline
-6. Detects and flags outliers using Isolation Forest
-7. Exports a single merged, preprocessed CSV ready for ML modelling
-
-Data sources (from data_source/):
-  - Agri-environment schemes (higher-level & lower-level) — land area under conservation
-  - Habitat connectivity — composite butterfly connectivity index
-  - Butterfly wider countryside — 7 abundance indices (target + factors)
-  - Plants wider countryside — plant abundance across habitats
-  - Habitat connectivity species trends — categorical species-level changes
-"""
 
 import os
 import random
@@ -32,16 +10,8 @@ from sklearn.preprocessing import StandardScaler
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(BASE, "data_source")
 
-# ──────────────────────────────────────────────
-# 1. LOAD RAW DATASETS
-# ──────────────────────────────────────────────
 
 def load_agri_schemes():
-    """Load agri-environment scheme data (higher & lower level) for England.
-    Returns area per year for each scheme level as SEPARATE features.
-    Note: per the dataset documentation, higher-level and entry-level areas
-    cannot be added together because higher-level agreements may be
-    underpinned by an entry-level scheme."""
     frames = {}
     for level, fname in [
         ("higher", "agri-environment-schemes-higher-level-England.csv"),
@@ -59,7 +29,6 @@ def load_agri_schemes():
 
 
 def load_habitat_connectivity():
-    """Load habitat connectivity composite trends (smoothed index)."""
     path = os.path.join(DATA, "habitat-connectivity",
                         "habitat-connectivity_UK-butterflies_composite-trends.csv")
     df = pd.read_csv(path)
@@ -86,16 +55,8 @@ def load_habitat_connectivity():
 
 
 def load_butterfly_abundance():
-    """Load all 7 butterfly wider-countryside abundance CSVs."""
     folder = os.path.join(DATA, "butterfly-wider-countryside")
     files = {
-        "all_species": "butterfly-wider-countryside_abundance-of-all-species.csv",
-        "habitat_specialist": "butterfly-wider-countryside_abundance-of-habitat-specialist-butterfly-species.csv",
-        "generalist": "butterfly-wider-countryside_abundance-of-generalist-butterfly-species.csv",
-        "farmland_generalist": "butterfly-wider-countryside_abundance-of-farmland-generalists.csv",
-        "farmland_specialist": "butterfly-wider-countryside_abundance-of-farmland-habitat-specialists.csv",
-        "woodland_generalist": "butterfly-wider-countryside_abundance-of-woodland-generalists.csv",
-        "woodland_specialist": "butterfly-wider-countryside_abundance-of-woodland-habitat-specialists.csv",
     }
     merged = None
     for key, fname in files.items():
@@ -118,13 +79,10 @@ def load_butterfly_abundance():
 
 
 def load_plant_abundance():
-    """Load plant abundance indices across habitats, pivoted to one row per year.
-    Also extracts confidence interval width as a data-quality proxy feature."""
     path = os.path.join(DATA, "plants-wider-countryside",
                         "plants-wider-countryside_abundance-of-species.csv")
     df = pd.read_csv(path)
 
-    # Pivot abundance index by habitat
     pivot = df.pivot_table(
         index="Year", columns="Habitat", values="Unsmoothed index", aggfunc="mean"
     ).reset_index()
@@ -133,7 +91,6 @@ def load_plant_abundance():
         for h in pivot.columns[1:]
     ]
 
-    # Extract CI width per habitat as uncertainty proxy
     if "Lower 95 CI" in df.columns and "Upper 95 CI" in df.columns:
         df["ci_width"] = df["Upper 95 CI"] - df["Lower 95 CI"]
         ci_pivot = df.pivot_table(
@@ -149,7 +106,6 @@ def load_plant_abundance():
 
 
 def load_species_connectivity_summary():
-    """Load individual species connectivity trends and encode as numeric features."""
     path = os.path.join(DATA, "habitat-connectivity",
                         "habitat-connectivity_UK-butterflies_individual-species-trends.csv")
     df = pd.read_csv(path)
@@ -170,12 +126,7 @@ def load_species_connectivity_summary():
     return pivot
 
 
-# ──────────────────────────────────────────────
-# 2. MERGE ALL DATASETS ON YEAR
-# ──────────────────────────────────────────────
-
 def merge_all():
-    """Merge all datasets on Year using outer join to preserve maximum coverage."""
     print("Loading datasets...")
     agri = load_agri_schemes()
     print(f"  Agri-environment schemes: {agri.shape}, years {agri['Year'].min()}-{agri['Year'].max()}")
@@ -204,13 +155,7 @@ def merge_all():
     return df
 
 
-# ──────────────────────────────────────────────
-# 3. HANDLE MISSING VALUES (Linear Interpolation)
-# ──────────────────────────────────────────────
-
 def impute_missing(df):
-    """Impute missing values using temporal interpolation and edge filling.
-    Returns the imputed DataFrame and a list of columns that had missing values."""
     print("\n--- Missing Value Imputation (Linear Interpolation) ---")
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     numeric_cols = [c for c in numeric_cols if c != "Year"]
@@ -244,21 +189,7 @@ def impute_missing(df):
     return df_imputed, cols_with_missing
 
 
-# ──────────────────────────────────────────────
-# 4. SIMULATED ANNEALING — Refine imputed values
-# ──────────────────────────────────────────────
-
 def _data_quality_score(df, numeric_cols):
-    """Composite quality metric combining temporal smoothness and cross-feature
-    correlation consistency.
-
-    Component 1 — Smoothness: ecological time-series should change gradually.
-      Measured as negative mean absolute second-difference (lower jitter = better).
-    Component 2 — Correlation preservation: imputed values should maintain the
-      natural statistical relationships between features.
-      Measured by average absolute pairwise correlation.
-
-    Returns a single scalar (higher = better quality)."""
     smoothness = 0.0
     for col in numeric_cols:
         s = df[col].dropna().values
@@ -277,36 +208,6 @@ def _data_quality_score(df, numeric_cols):
 def simulated_annealing_refine(df, imputed_cols, max_iterations=1000,
                                 initial_temp=10.0, cooling_rate=0.995,
                                 perturbation_scale=0.02):
-    """Use Simulated Annealing to refine imputed values and maximise data quality.
-
-    Problem:
-      After linear interpolation, imputed values may introduce artefacts — abrupt
-      jumps at series boundaries or broken cross-feature correlations. This is
-      especially problematic for the plant abundance data (only 10 years of real
-      observations, 25 years imputed) and habitat connectivity (ends in 2012,
-      12 years extrapolated forward).
-
-    Approach:
-      SA treats each imputed cell as a tuneable parameter. Each iteration:
-        1. Randomly selects one imputed column and one row
-        2. Perturbs the value by a small amount (scaled to column std)
-        3. Evaluates the resulting data quality score
-        4. Accepts the change if it improves quality, OR accepts it
-           probabilistically if it worsens quality (probability = exp(Δ/T))
-      The temperature T starts high (allowing exploration) and cools gradually,
-      converging toward a high-quality solution.
-
-    This ensures the maximum amount of viable, consistent data is available
-    for downstream ML modelling.
-
-    Args:
-        df: DataFrame with initial imputations applied
-        imputed_cols: List of column names that contained missing values
-        max_iterations: Number of SA iterations to run
-        initial_temp: Starting temperature (higher = more exploration early on)
-        cooling_rate: Temperature decay per iteration (closer to 1 = slower cooling)
-        perturbation_scale: Fraction of column std used as perturbation magnitude
-    """
     print("\n--- Simulated Annealing: Refining Imputed Values ---")
     if not imputed_cols:
         print("  No imputed columns to refine — skipping.")
@@ -343,7 +244,7 @@ def simulated_annealing_refine(df, imputed_cols, max_iterations=1000,
         std = col_stds[col]
         old_val = df_current.at[row, col]
         perturbation = np.random.normal(0, perturbation_scale * std)
-        new_val = max(0.0, old_val + perturbation)  # ecological indices >= 0
+        new_val = max(0.0, old_val + perturbation)
 
         df_candidate = df_current.copy()
         df_candidate.at[row, col] = new_val
@@ -351,7 +252,6 @@ def simulated_annealing_refine(df, imputed_cols, max_iterations=1000,
         new_score = _data_quality_score(df_candidate, numeric_cols)
         delta = new_score - current_score
 
-        # SA acceptance criterion
         if delta > 0:
             accept = True
             improved += 1
@@ -378,17 +278,9 @@ def simulated_annealing_refine(df, imputed_cols, max_iterations=1000,
     return best_df
 
 
-# ──────────────────────────────────────────────
-# 5. FEATURE ENGINEERING
-# ──────────────────────────────────────────────
-
 def engineer_features(df):
-    """Create derived features that may help explain butterfly decline.
-    Note: higher-level and lower-level agri-environment scheme areas are kept
-    as separate features (they cannot be summed per the data documentation)."""
     print("\n--- Feature Engineering ---")
 
-    # Year-over-year percentage change for key indices
     for col in [
         "butterfly_all_species_smoothed",
         "butterfly_habitat_specialist_smoothed",
@@ -398,7 +290,6 @@ def engineer_features(df):
         if col in df.columns:
             df[f"{col}_yoy_change"] = df[col].pct_change() * 100
 
-    # Ratios between butterfly sub-groups
     if ("butterfly_habitat_specialist_smoothed" in df.columns and
             "butterfly_generalist_smoothed" in df.columns):
         df["specialist_generalist_ratio"] = (
@@ -416,13 +307,11 @@ def engineer_features(df):
     if "butterfly_all_species_smoothed_yoy_change" in df.columns:
         df["decline_flag"] = (df["butterfly_all_species_smoothed_yoy_change"] < 0).astype(int)
 
-    # Rolling averages for agri-environment schemes (separate, NOT summed)
     for level in ["higher", "lower"]:
         col = f"agri_area_{level}_mha"
         if col in df.columns:
             df[f"agri_area_{level}_5yr_avg"] = df[col].rolling(window=5, min_periods=1).mean()
 
-    # Lagged features (ecological effects are often delayed 1-3 years)
     for lag in [1, 2, 3]:
         for col in ["agri_area_higher_mha", "agri_area_lower_mha",
                     "habitat_connectivity_index"]:
@@ -437,12 +326,7 @@ def engineer_features(df):
     return df
 
 
-# ──────────────────────────────────────────────
-# 6. OUTLIER DETECTION
-# ──────────────────────────────────────────────
-
 def detect_outliers(df):
-    """Detect outliers using Isolation Forest. Flag but do not remove them."""
     print("\n--- Outlier Detection (Isolation Forest) ---")
     numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     numeric_cols = [c for c in numeric_cols if c != "Year"]
@@ -465,12 +349,7 @@ def detect_outliers(df):
     return df
 
 
-# ──────────────────────────────────────────────
-# 7. RESTRICT TO ANALYSIS PERIOD
-# ──────────────────────────────────────────────
-
 def restrict_period(df, start_year=1990, end_year=2024):
-    """Restrict dataset to the analysis period where most data overlaps."""
     print(f"\n--- Restricting to {start_year}-{end_year} ---")
     df = df[(df["Year"] >= start_year) & (df["Year"] <= end_year)].copy()
     df.reset_index(drop=True, inplace=True)
@@ -478,36 +357,24 @@ def restrict_period(df, start_year=1990, end_year=2024):
     return df
 
 
-# ──────────────────────────────────────────────
-# 8. MAIN PIPELINE
-# ──────────────────────────────────────────────
-
 def main():
     print("=" * 60)
     print("PREPROCESSING PIPELINE — Butterfly Decline Analysis")
     print("  AI Optimisation: Simulated Annealing")
     print("=" * 60)
 
-    # Load & merge
     df = merge_all()
 
-    # Restrict to analysis period (1990-2024)
     df = restrict_period(df, start_year=1990, end_year=2024)
 
-    # Initial imputation via linear interpolation
     df, cols_with_missing = impute_missing(df)
 
-    # SIMULATED ANNEALING: refine imputed values to maximise
-    # temporal smoothness and cross-feature correlation consistency
     df = simulated_annealing_refine(df, cols_with_missing)
 
-    # Feature engineering
     df = engineer_features(df)
 
-    # Outlier detection
     df = detect_outliers(df)
 
-    # Final summary
     print("\n" + "=" * 60)
     print("FINAL PREPROCESSED DATASET SUMMARY")
     print("=" * 60)
@@ -524,7 +391,6 @@ def main():
     if key_cols:
         print(df[["Year"] + key_cols].describe().round(2).to_string())
 
-    # Save
     out_path = os.path.join(BASE, "data_preprocessed.csv")
     df.to_csv(out_path, index=False)
     print(f"\nPreprocessed data saved to: {out_path}")
