@@ -37,18 +37,20 @@ DATA = os.path.join(BASE, "data_source")
 # ──────────────────────────────────────────────
 
 def load_agri_schemes():
-    """Load and pivot agri-environment scheme data (higher & lower level).
-    Returns UK-wide total area per year for each scheme level."""
+    """Load agri-environment scheme data (higher & lower level) for England.
+    Returns area per year for each scheme level as SEPARATE features.
+    Note: per the dataset documentation, higher-level and entry-level areas
+    cannot be added together because higher-level agreements may be
+    underpinned by an entry-level scheme."""
     frames = {}
     for level, fname in [
-        ("higher", "agri-environment-schemes-higher-level.csv"),
-        ("lower", "agri-environment-schemes-lower-level.csv"),
+        ("higher", "agri-environment-schemes-higher-level-England.csv"),
+        ("lower", "agri-environment-schemes-lower-level-England.csv"),
     ]:
         path = os.path.join(DATA, "agri-environment-schemes", fname)
         df = pd.read_csv(path)
-        agg = df.groupby("Year")["Area (Million Hectares)"].sum().reset_index()
-        agg.rename(columns={"Area (Million Hectares)": f"agri_area_{level}_mha"}, inplace=True)
-        frames[level] = agg
+        df.rename(columns={"Area (Million Hectares)": f"agri_area_{level}_mha"}, inplace=True)
+        frames[level] = df[["Year", f"agri_area_{level}_mha"]]
 
     merged = frames["higher"].merge(frames["lower"], on="Year", how="outer")
     merged.sort_values("Year", inplace=True)
@@ -116,10 +118,13 @@ def load_butterfly_abundance():
 
 
 def load_plant_abundance():
-    """Load plant abundance indices across habitats, pivoted to one row per year."""
+    """Load plant abundance indices across habitats, pivoted to one row per year.
+    Also extracts confidence interval width as a data-quality proxy feature."""
     path = os.path.join(DATA, "plants-wider-countryside",
                         "plants-wider-countryside_abundance-of-species.csv")
     df = pd.read_csv(path)
+
+    # Pivot abundance index by habitat
     pivot = df.pivot_table(
         index="Year", columns="Habitat", values="Unsmoothed index", aggfunc="mean"
     ).reset_index()
@@ -127,6 +132,19 @@ def load_plant_abundance():
         f"plant_{h.lower().replace(' ', '_').replace('&', 'and')}_index"
         for h in pivot.columns[1:]
     ]
+
+    # Extract CI width per habitat as uncertainty proxy
+    if "Lower 95 CI" in df.columns and "Upper 95 CI" in df.columns:
+        df["ci_width"] = df["Upper 95 CI"] - df["Lower 95 CI"]
+        ci_pivot = df.pivot_table(
+            index="Year", columns="Habitat", values="ci_width", aggfunc="mean"
+        ).reset_index()
+        ci_pivot.columns = ["Year"] + [
+            f"plant_{h.lower().replace(' ', '_').replace('&', 'and')}_ci_width"
+            for h in ci_pivot.columns[1:]
+        ]
+        pivot = pivot.merge(ci_pivot, on="Year", how="outer")
+
     return pivot
 
 
@@ -365,12 +383,12 @@ def simulated_annealing_refine(df, imputed_cols, max_iterations=1000,
 # ──────────────────────────────────────────────
 
 def engineer_features(df):
-    """Create derived features that may help explain butterfly decline."""
+    """Create derived features that may help explain butterfly decline.
+    Note: higher-level and lower-level agri-environment scheme areas are kept
+    as separate features (they cannot be summed per the data documentation)."""
     print("\n--- Feature Engineering ---")
 
-    if "agri_area_higher_mha" in df.columns and "agri_area_lower_mha" in df.columns:
-        df["agri_area_total_mha"] = df["agri_area_higher_mha"] + df["agri_area_lower_mha"]
-
+    # Year-over-year percentage change for key indices
     for col in [
         "butterfly_all_species_smoothed",
         "butterfly_habitat_specialist_smoothed",
@@ -380,6 +398,7 @@ def engineer_features(df):
         if col in df.columns:
             df[f"{col}_yoy_change"] = df[col].pct_change() * 100
 
+    # Ratios between butterfly sub-groups
     if ("butterfly_habitat_specialist_smoothed" in df.columns and
             "butterfly_generalist_smoothed" in df.columns):
         df["specialist_generalist_ratio"] = (
@@ -397,14 +416,18 @@ def engineer_features(df):
     if "butterfly_all_species_smoothed_yoy_change" in df.columns:
         df["decline_flag"] = (df["butterfly_all_species_smoothed_yoy_change"] < 0).astype(int)
 
-    if "agri_area_total_mha" in df.columns:
-        df["agri_area_5yr_cumulative"] = df["agri_area_total_mha"].rolling(window=5, min_periods=1).sum()
+    # Rolling averages for agri-environment schemes (separate, NOT summed)
+    for level in ["higher", "lower"]:
+        col = f"agri_area_{level}_mha"
+        if col in df.columns:
+            df[f"agri_area_{level}_5yr_avg"] = df[col].rolling(window=5, min_periods=1).mean()
 
+    # Lagged features (ecological effects are often delayed 1-3 years)
     for lag in [1, 2, 3]:
-        if "agri_area_total_mha" in df.columns:
-            df[f"agri_area_total_lag{lag}"] = df["agri_area_total_mha"].shift(lag)
-        if "habitat_connectivity_index" in df.columns:
-            df[f"habitat_connectivity_lag{lag}"] = df["habitat_connectivity_index"].shift(lag)
+        for col in ["agri_area_higher_mha", "agri_area_lower_mha",
+                    "habitat_connectivity_index"]:
+            if col in df.columns:
+                df[f"{col}_lag{lag}"] = df[col].shift(lag)
 
     df.bfill(inplace=True)
     df.ffill(inplace=True)
